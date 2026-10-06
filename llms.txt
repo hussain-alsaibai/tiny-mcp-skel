@@ -1,0 +1,37 @@
+# tiny-mcp-skel
+
+Stdlib-only MCP (Model Context Protocol) server skeleton. ~150 LOC of executable code combining tiny-router blueprints + tiny-validator McpServer schema. Zero external runtime dependencies (just tiny-router + tiny-validator).
+
+## Run
+
+```bash
+pip install tiny-router tiny-validator
+python examples/echo_server.py
+```
+
+## API
+
+```python
+from tiny_mcp_skel import make_server, run_stdio
+from tiny_validator import Schema, String
+
+server = make_server(name="my-mcp", version="0.1.0")
+
+@server.tool(
+    name="echo",
+    description="Echo the input.",
+    input_schema=Schema({"text": String()}),
+)
+def echo_handler(params):
+    return {"content": [{"type": "text", "text": params["text"]}]}
+
+run_stdio(server)
+```
+
+## Features
+
+- JSON-RPC 2.0 over stdio (the default MCP transport)
+- HTTP transport via `server.as_router()`
+- Eager manifest validation: tool registrations run `validate_mcp_manifest` on every add
+- Standard MCP methods: `initialize`, `tools/list`, `tools/call`, `ping`
+- Integrates with `tiny-router-sse` for SSE-aware OpenAPI export

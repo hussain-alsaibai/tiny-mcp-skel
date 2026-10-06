@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiny-mcp-skel"
+version = "0.1.0"
+description = "Stdlib-only MCP server skeleton. ~150 LOC combining tiny-router blueprints + tiny-validator McpServer schema. Like FastMCP in one file."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [{name = "OpenClaw", email = "hussain.alsaibai@gmail.com"}]
+keywords = ["mcp", "model-context-protocol", "server", "skeleton", "agent", "tool"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "tiny-router>=0.6.0",
+    "tiny-validator>=0.5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/hussain-alsaibai/tiny-mcp-skel"
+Source = "https://github.com/hussain-alsaibai/tiny-mcp-skel"
+
+[tool.setuptools]
+py-modules = ["tiny_mcp_skel"]
