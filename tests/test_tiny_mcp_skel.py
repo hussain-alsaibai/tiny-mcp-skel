@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import unittest
 from io import StringIO
@@ -174,9 +175,97 @@ class TestHandle(unittest.TestCase):
         r = self.s.handle(McpRequest({"id": 3, "method": "tools/call", "params": {"name": "echo", "arguments": {"text": "x"}}}))
         self.assertEqual(r.result["content"][0]["text"], "x")
 
-    def test_ping(self):
+    def test_ping_is_removed_from_the_protocol(self):
+        # ping was removed as a core method in the 2026-07-28 revision.
         r = self.s.handle(McpRequest({"id": 4, "method": "ping", "params": {}}))
-        self.assertEqual(r.result, {"pong": True})
+        self.assertIsNone(r.result)
+        self.assertEqual(r.error["code"], -32601)
+
+    def test_server_discover(self):
+        r = self.s.handle(
+            McpRequest({"id": 40, "method": "server/discover", "params": {}})
+        )
+        self.assertIn("2026-07-28", r.result["supportedVersions"])
+        self.assertEqual(r.result["resultType"], "complete")
+        self.assertIn("capabilities", r.result)
+        # Discover is cacheable, so it carries ttlMs and cacheScope.
+        self.assertIn("ttlMs", r.result)
+        self.assertIn("cacheScope", r.result)
+
+    def test_server_discover_requires_params(self):
+        # The schema marks params as required on DiscoverRequest.
+        r = self.s.handle(
+            McpRequest({"id": 41, "method": "server/discover", "params": {}})
+        )
+        self.assertIsNotNone(r.result)
+
+    def test_every_result_carries_result_type(self):
+        for method, params in (
+            ("server/discover", {}),
+            ("tools/list", {}),
+            (
+                "tools/call",
+                {"name": "echo", "arguments": {"text": "x"}},
+            ),
+        ):
+            r = self.s.handle(McpRequest({"id": 9, "method": method, "params": params}))
+            self.assertEqual(r.result["resultType"], "complete", method)
+
+    def test_every_result_carries_server_info_meta(self):
+        r = self.s.handle(McpRequest({"id": 10, "method": "tools/list", "params": {}}))
+        meta = r.result["_meta"]
+        self.assertEqual(
+            meta["io.modelcontextprotocol/serverInfo"],
+            {"name": "t", "version": "0.1.0"},
+        )
+
+    def test_tools_list_is_cacheable(self):
+        r = self.s.handle(McpRequest({"id": 11, "method": "tools/list", "params": {}}))
+        self.assertIn("ttlMs", r.result)
+        self.assertEqual(r.result["cacheScope"], "public")
+
+    def test_supported_protocol_version_in_meta_is_accepted(self):
+        r = self.s.handle(
+            McpRequest(
+                {
+                    "id": 12,
+                    "method": "tools/list",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+                        }
+                    },
+                }
+            )
+        )
+        self.assertIsNone(r.error)
+
+    def test_unsupported_protocol_version_is_rejected(self):
+        r = self.s.handle(
+            McpRequest(
+                {
+                    "id": 13,
+                    "method": "tools/list",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "1999-01-01"
+                        }
+                    },
+                }
+            )
+        )
+        self.assertEqual(r.error["code"], -32022)
+        self.assertEqual(r.error["data"]["requested"], "1999-01-01")
+        self.assertIn("2026-07-28", r.error["data"]["supported"])
+
+    def test_legacy_initialize_still_answered(self):
+        # Legacy clients must degrade gracefully, not hit a dead end.
+        r = self.s.handle(
+            McpRequest({"id": 14, "method": "initialize", "params": {}})
+        )
+        self.assertEqual(r.result["protocolVersion"], "2026-07-28")
+        self.assertEqual(r.result["serverInfo"]["name"], "t")
+        self.assertEqual(r.result["resultType"], "complete")
 
     def test_unknown_method(self):
         r = self.s.handle(McpRequest({"id": 5, "method": "x/y"}))
@@ -201,7 +290,7 @@ class TestStdioTransport(unittest.TestCase):
     def test_basic_loop(self):
         inp = StringIO(
             chr(10).join([
-                json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+                json.dumps({"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {}}),
                 json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "echo", "arguments": {"text": "hi"}}}),
             ]) + chr(10)
         )
@@ -211,11 +300,18 @@ class TestStdioTransport(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         r1 = json.loads(lines[0])
         r2 = json.loads(lines[1])
-        self.assertEqual(r1["result"], {"pong": True})
+        self.assertIn("2026-07-28", r1["result"]["supportedVersions"])
         self.assertEqual(r2["result"]["content"][0]["text"], "hi")
 
     def test_blank_lines_skipped(self):
-        inp = StringIO(chr(10) + chr(10) + json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}) + chr(10))
+        inp = StringIO(
+            chr(10)
+            + chr(10)
+            + json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "method": "server/discover", "params": {}}
+            )
+            + chr(10)
+        )
         out = StringIO()
         run_stdio(self.s, input_stream=inp, output_stream=out)
         self.assertEqual(len([l for l in out.getvalue().split(chr(10)) if l]), 1)
@@ -288,13 +384,125 @@ class TestAsRouter(unittest.TestCase):
                 "REQUEST_METHOD": "POST",
                 "PATH_INFO": "/mcp",
                 "QUERY_STRING": "",
-                "CONTENT_LENGTH": str(len(b'{"jsonrpc":"2.0","id":1,"method":"ping"}')),
-                "wsgi.input": FakeInput(b'{"jsonrpc":"2.0","id":1,"method":"ping"}'),
+                "CONTENT_LENGTH": str(len(b'{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}')),
+                "wsgi.input": FakeInput(b'{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}'),
             },
             lambda s, h: None,
         ))
         r = _json.loads(body)
-        self.assertEqual(r["result"], {"pong": True})
+        self.assertIn("2026-07-28", r["result"]["supportedVersions"])
+
+
+# ---------- Schema conformance ----------
+
+# The authoritative MCP JSON Schema for the revision this skeleton
+# speaks. Pinning it in the test suite means a response shape can never
+# silently drift from the spec again.
+#
+# The schema lives in the upstream repository:
+#   https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/main/schema/2026-07-28/schema.json
+#
+# The test is skipped when the schema file is not available locally, so
+# the suite still runs in an offline environment.
+SCHEMA_PATH = os.environ.get(
+    "MCP_SCHEMA_PATH",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "tests", "schema-2026-07-28.json"),
+)
+
+
+def _load_schema():
+    if not os.path.exists(SCHEMA_PATH):
+        return None
+    with open(SCHEMA_PATH, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+class TestSchemaConformance(unittest.TestCase):
+    """Validate real responses against the upstream MCP JSON Schema."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import jsonschema  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest("jsonschema is not installed")
+        cls.schema = _load_schema()
+        if cls.schema is None:
+            raise unittest.SkipTest("MCP schema file not available at " + SCHEMA_PATH)
+        cls.defs = cls.schema.get("$defs", {})
+
+    def _validator(self, defname):
+        import jsonschema
+
+        sub = {
+            "$schema": self.schema["$schema"],
+            "$ref": "#/$defs/" + defname,
+            "$defs": self.defs,
+        }
+        return jsonschema.Draft202012Validator(sub)
+
+    def _server(self):
+        s = make_server(name="skel-test", version="0.2.0")
+
+        @s.tool(name="echo", description="Echo the input back to the caller.")
+        def echo(params):
+            return {"content": [{"type": "text", "text": params["text"]}]}
+
+        @s.tool(name="noop", description="A tool that takes no arguments.")
+        def noop(params):
+            return {"content": []}
+
+        return s
+
+    def test_discover_result_matches_schema(self):
+        s = self._server()
+        r = s.handle(McpRequest({"id": 1, "method": "server/discover", "params": {}}))
+        errors = list(self._validator("DiscoverResult").iter_errors(r.result))
+        self.assertEqual(errors, [], [e.message for e in errors])
+
+    def test_tools_list_result_matches_schema(self):
+        s = self._server()
+        r = s.handle(McpRequest({"id": 2, "method": "tools/list", "params": {}}))
+        errors = list(self._validator("ListToolsResult").iter_errors(r.result))
+        self.assertEqual(errors, [], [e.message for e in errors])
+
+    def test_tools_call_result_matches_schema(self):
+        s = self._server()
+        r = s.handle(
+            McpRequest(
+                {
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "echo", "arguments": {"text": "hi"}},
+                }
+            )
+        )
+        errors = list(self._validator("CallToolResult").iter_errors(r.result))
+        self.assertEqual(errors, [], [e.message for e in errors])
+
+    def test_jsonrpc_envelope_matches_schema(self):
+        import jsonschema
+
+        s = self._server()
+        r = s.handle(McpRequest({"id": 4, "method": "server/discover", "params": {}}))
+        validator = jsonschema.Draft202012Validator(
+            {
+                "$schema": self.schema["$schema"],
+                "$ref": "#/$defs/JSONRPCResultResponse",
+                "$defs": self.defs,
+            }
+        )
+        errors = list(validator.iter_errors(r.to_dict()))
+        self.assertEqual(errors, [], [e.message for e in errors])
+
+    def test_tool_without_input_schema_still_emits_one(self):
+        """The MCP schema requires inputSchema on every tool."""
+        s = self._server()
+        r = s.handle(McpRequest({"id": 5, "method": "tools/list", "params": {}}))
+        for tool in r.result["tools"]:
+            self.assertIn("inputSchema", tool)
+            self.assertEqual(tool["inputSchema"]["type"], "object")
 
 
 if __name__ == "__main__":

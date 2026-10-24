@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tiny-mcp-skel"
-version = "0.1.0"
+version = "0.2.0"
 description = "Stdlib-only MCP server skeleton. ~150 LOC combining tiny-router blueprints + tiny-validator McpServer schema. Like FastMCP in one file."
 readme = "README.md"
 license = {text = "MIT"}
@@ -27,6 +27,9 @@ dependencies = [
     "tiny-router>=0.6.0",
     "tiny-validator>=0.5.0",
 ]
+
+[project.optional-dependencies]
+dev = ["jsonschema>=4.0"]
 
 [project.urls]
 Homepage = "https://github.com/hussain-alsaibai/tiny-mcp-skel"

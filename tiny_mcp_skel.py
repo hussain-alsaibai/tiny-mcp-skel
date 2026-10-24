@@ -31,12 +31,19 @@ Usage::
     server = make_server(name="my-mcp", version="0.1.0")
     run_stdio(server)
 
-The skeleton implements the subset of MCP needed by the test harness:
+The skeleton implements the **2026-07-28** MCP revision:
 
-- ``initialize`` -> server metadata + capabilities
-- ``tools/list`` -> list of registered tools (with JSON Schema input)
+- ``server/discover`` -> supported versions, capabilities, identity
+- ``tools/list`` -> registered tools (with JSON Schema input), cacheable
 - ``tools/call`` -> dispatch to the registered handler, return content
-- ``ping`` -> ``{"pong": true}``
+
+The 2026-07-28 revision removed the ``initialize`` handshake, made MCP
+stateless, and made ``server/discover`` mandatory. This skeleton
+implements that dialect: every request carries its protocol version in
+``_meta``, every result carries a ``resultType``, and the server
+identifies itself in each result's ``_meta``. A legacy
+``initialize`` call is still answered, so older clients degrade
+gracefully instead of hitting a dead end.
 """
 
 from __future__ import annotations
@@ -71,7 +78,48 @@ except ImportError:  # pragma: no cover - flat-layout fallback for tests
         openapi_spec_streaming_overlay = None  # type: ignore
 
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
+
+# ---------- Protocol constants ----------
+
+#: The MCP specification revision this skeleton speaks. Revisions are
+#: dates, not semver: the spec moved to YYYY-MM-DD with the 2025-11-25
+#: revision, and 2026-07-28 removed the initialize handshake entirely.
+PROTOCOL_VERSION = "2026-07-28"
+
+#: Protocol revisions this skeleton can serve. A client picks one from
+#: this list during discovery.
+SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28",)
+
+#: Default freshness hint (milliseconds) on cacheable list results.
+DEFAULT_TTL_MS = 30000
+
+#: Result type for an ordinary, final result.
+RESULT_TYPE_COMPLETE = "complete"
+
+#: Result type for a multi-round-trip interim result.
+RESULT_TYPE_INPUT_REQUIRED = "input_required"
+
+#: JSON-RPC error code for an unsupported protocol version (SEP-2575).
+ERR_UNSUPPORTED_PROTOCOL_VERSION = -32022
+
+#: JSON-RPC error code for a method that does not exist.
+ERR_METHOD_NOT_FOUND = -32601
+
+#: JSON-RPC error code for invalid params.
+ERR_INVALID_PARAMS = -32602
+
+#: Reserved _meta key carrying the protocol version of a request.
+META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
+
+#: Reserved _meta key carrying the client capabilities for a request.
+META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
+
+#: Reserved _meta key carrying the client identity for a request.
+META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
+
+#: Reserved _meta key carrying the server identity in a result.
+META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 
 
 # ---------- Core data types ----------
@@ -231,8 +279,19 @@ class McpSkelServer:
         return self._manifest
 
     def list_tools(self) -> list[dict[str, Any]]:
-        """Return the tools/list response body."""
-        return [t.to_dict() for t, _ in self._tools]
+        """Return the tools/list response body.
+
+        The MCP schema requires inputSchema on every tool, so a tool
+        registered without one gets an empty object schema rather than
+        being emitted without the field.
+        """
+        out = []
+        for tool, _ in self._tools:
+            entry = tool.to_dict()
+            if not entry.get("inputSchema"):
+                entry["inputSchema"] = {"type": "object", "properties": {}}
+            out.append(entry)
+        return out
 
     def call_tool(self, name: str, params: dict) -> dict[str, Any]:
         """Dispatch a tools/call to the registered handler.
@@ -262,25 +321,105 @@ class McpSkelServer:
 
     # ---- request dispatch ----
 
+    def _server_meta(self) -> dict:
+        """The _meta block every result carries (SEP-2575).
+
+        Servers SHOULD identify themselves in each result _meta so the
+        client always knows which build answered.
+        """
+        return {
+            META_SERVER_INFO: {
+                "name": self.name,
+                "version": self.version,
+            }
+        }
+
+    def _request_protocol_version(self, request: "McpRequest") -> str:
+        """The protocol version a request declares, if any.
+
+        The 2026-07-28 revision made MCP stateless: every request
+        carries its protocol version and client capabilities in _meta.
+        """
+        meta = request.params.get("_meta") if isinstance(request.params, Mapping) else None
+        if isinstance(meta, Mapping):
+            value = meta.get(META_PROTOCOL_VERSION)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _result(self, request_id: Any, payload: Mapping) -> McpResponse:
+        """Wrap a result payload in the current-spec envelope.
+
+        Every result must carry resultType, and should carry the
+        server identity in _meta.
+        """
+        body = dict(payload)
+        body.setdefault("resultType", RESULT_TYPE_COMPLETE)
+        meta = dict(body.get("_meta") or {})
+        meta.setdefault(META_SERVER_INFO, {"name": self.name, "version": self.version})
+        body["_meta"] = meta
+        return McpResponse(request_id, result=body)
+
+    def discover(self, request_id: Any = None) -> McpResponse:
+        """Handle server/discover (SEP-2575).
+
+        Servers MUST implement this RPC to advertise their supported
+        protocol versions, capabilities, and identity. The result is
+        cacheable, so it carries ttlMs and cacheScope.
+        """
+        return self._result(
+            request_id,
+            {
+                "supportedVersions": list(SUPPORTED_PROTOCOL_VERSIONS),
+                "capabilities": self._manifest.to_dict().get("capabilities", {}),
+                "ttlMs": DEFAULT_TTL_MS,
+                "cacheScope": "public",
+            },
+        )
+
     def handle(self, request: McpRequest) -> McpResponse:
-        """Dispatch a single MCP request to the right method handler."""
-        if request.method == "initialize":
+        """Dispatch a single MCP request to the right method handler.
+
+        Implements the 2026-07-28 revision: no initialize handshake,
+        server/discover is mandatory, and every result carries a
+        resultType.
+        """
+        method = request.method
+
+        # server/discover is the entry point for up-front version
+        # selection, and the backward-compatibility probe on stdio.
+        if method == "server/discover":
+            return self.discover(request.id)
+
+        # Version negotiation is inline via _meta on every request.
+        # An unknown version is a protocol error, not a silent success.
+        requested = self._request_protocol_version(request)
+        if requested and requested not in SUPPORTED_PROTOCOL_VERSIONS:
             return McpResponse(
                 request.id,
-                result={
-                    "protocolVersion": "1.0",
-                    "serverInfo": {
-                        "name": self.name,
-                        "version": self.version,
+                error={
+                    "code": ERR_UNSUPPORTED_PROTOCOL_VERSION,
+                    "message": "unsupported protocol version: " + requested,
+                    "data": {
+                        "requested": requested,
+                        "supported": list(SUPPORTED_PROTOCOL_VERSIONS),
                     },
-                    "capabilities": self._manifest.to_dict().get(
-                        "capabilities", {}
-                    ),
                 },
             )
-        if request.method == "tools/list":
-            return McpResponse(request.id, result={"tools": self.list_tools()})
-        if request.method == "tools/call":
+
+        if method == "tools/list":
+            # List results are cacheable: ttlMs and cacheScope let
+            # clients cache them and cut polling.
+            return self._result(
+                request.id,
+                {
+                    "tools": self.list_tools(),
+                    "ttlMs": DEFAULT_TTL_MS,
+                    "cacheScope": "public",
+                },
+            )
+
+        if method == "tools/call":
             params = request.params or {}
             name = params.get("name")
             call_params = params.get("arguments", {}) or {}
@@ -288,7 +427,7 @@ class McpSkelServer:
                 return McpResponse(
                     request.id,
                     error={
-                        "code": -32602,
+                        "code": ERR_INVALID_PARAMS,
                         "message": "params.name must be a string",
                     },
                 )
@@ -299,14 +438,34 @@ class McpSkelServer:
                     request.id,
                     error={"code": exc.code, "message": exc.message},
                 )
-            return McpResponse(request.id, result=result)
-        if request.method == "ping":
-            return McpResponse(request.id, result={"pong": True})
+            # A tool result must carry resultType too.
+            body = dict(result) if isinstance(result, Mapping) else {"content": []}
+            body.setdefault("resultType", RESULT_TYPE_COMPLETE)
+            meta = dict(body.get("_meta") or {})
+            meta.setdefault(
+                META_SERVER_INFO, {"name": self.name, "version": self.version}
+            )
+            body["_meta"] = meta
+            return McpResponse(request.id, result=body)
+
+        # The initialize handshake was removed in the 2026-07-28
+        # revision. Answer anyway so a legacy client gets a usable
+        # response instead of a dead-end method-not-found.
+        if method == "initialize":
+            return self._result(
+            request.id,
+            {
+                "protocolVersion": PROTOCOL_VERSION,
+                "serverInfo": {"name": self.name, "version": self.version},
+                "capabilities": self._manifest.to_dict().get("capabilities", {}),
+            },
+        )
+
         return McpResponse(
             request.id,
             error={
-                "code": -32601,
-                "message": f"method not found: {request.method!r}",
+                "code": ERR_METHOD_NOT_FOUND,
+                "message": "method not found: " + repr(request.method),
             },
         )
 
@@ -430,5 +589,17 @@ __all__ = [
     "McpCallError",
     "make_server",
     "run_stdio",
+    "PROTOCOL_VERSION",
+    "SUPPORTED_PROTOCOL_VERSIONS",
+    "DEFAULT_TTL_MS",
+    "RESULT_TYPE_COMPLETE",
+    "RESULT_TYPE_INPUT_REQUIRED",
+    "ERR_UNSUPPORTED_PROTOCOL_VERSION",
+    "ERR_METHOD_NOT_FOUND",
+    "ERR_INVALID_PARAMS",
+    "META_PROTOCOL_VERSION",
+    "META_CLIENT_CAPABILITIES",
+    "META_CLIENT_INFO",
+    "META_SERVER_INFO",
     "__version__",
 ]

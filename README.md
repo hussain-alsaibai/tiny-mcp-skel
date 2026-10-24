@@ -6,7 +6,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Zero Runtime Deps](https://img.shields.io/badge/runtime-deps-tiny--router%20%2B%20tiny--validator-brightgreen.svg)](#dependencies)
 [![Part of the tiny-* ecosystem](https://img.shields.io/badge/tiny--*-ecosystem-purple.svg)](#ecosystem)
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](tiny_mcp_skel.py)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](tiny_mcp_skel.py)
+[![MCP Spec](https://img.shields.io/badge/MCP%20spec-2026--07--28-blue.svg)](https://modelcontextprotocol.io/specification/2026-07-28/changelog)
 
 `tiny-mcp-skel` is a single-file, stdlib-only Model Context Protocol (MCP) server skeleton. The whole skeleton is under 200 LOC of executable code, and runs over stdio (the default MCP transport) out of the box.
 
@@ -23,7 +24,7 @@ The skeleton is built from three tiny-* primitives:
 from tiny_mcp_skel import make_server, run_stdio
 from tiny_validator import Schema, String
 
-server = make_server(name="echo-mcp", version="0.1.0", title="Echo MCP")
+server = make_server(name="echo-mcp", version="0.2.0", title="Echo MCP")
 
 @server.tool(
     name="echo",
@@ -44,7 +45,9 @@ if __name__ == "__main__":
 - **JSON-RPC 2.0 over stdio** - the default MCP transport
 - **HTTP transport** - `server.as_router()` returns a tiny-router `Router` with `GET /openapi.json` and `POST /mcp`
 - **Eager manifest validation** - tool registrations rebuild the McpServer manifest and run `validate_mcp_manifest`; a typo in a tool name fails fast
-- **Standard MCP methods** - `initialize`, `tools/list`, `tools/call`, `ping`
+- **Current MCP spec** - speaks the `2026-07-28` revision: `server/discover`, `tools/list`, `tools/call`
+- **Stateless** - every request carries its protocol version in `_meta`; no `initialize` handshake
+- **Schema-verified** - the test suite validates real responses against the upstream MCP JSON Schema
 - **Streaming-ready** - integrates with `tiny-router-sse` for SSE-aware OpenAPI export
 
 ## Installation
@@ -61,10 +64,40 @@ The Model Context Protocol server ecosystem has been wildly inconsistent on pack
 
 The September 2026 MCP-Registry v1 schema forced consolidation on three things:
 - A `mcp.server.json` manifest with `name`, `version`, `tools: [{name, description, inputSchema}]`
-- An `initialize` handler that returns server metadata + supported protocol versions
+- A handshake handler that returns server metadata + supported protocol versions
 - A `tools/list` handler that emits the registered tools in the registry-expected shape
 
-The stdlib-first MCP server skeletons that landed that week (`mcpskel/zero`, `pymcp-min`, `mcpbox/lite`) are all essentially the same shape - and `tiny-mcp-skel` is the most concise of them. The full server is under 200 LOC, the test suite is 30 tests, and the only runtime dependencies are two other tiny-* repos that together add another ~70 KB of single-file code.
+The stdlib-first MCP server skeletons that landed that week (`mcpskel/zero`, `pymcp-min`, `mcpbox/lite`) are all essentially the same shape - and `tiny-mcp-skel` is the most concise of them. The full server is under 200 LOC, the test suite is 43 tests, and the only runtime dependencies are two other tiny-* repos that together add another ~70 KB of single-file code.
+
+### The 2026-07-28 revision
+
+The MCP specification revision **2026-07-28** changed the protocol shape
+substantially. A skeleton that still speaks the old dialect is invisible to
+modern clients, because no current client offers the `initialize` handshake
+any more.
+
+| Change | Effect on this skeleton |
+|---|---|
+| `initialize` handshake removed | `server/discover` is now the entry point; a legacy `initialize` call is still answered so old clients degrade gracefully |
+| `ping` removed as a core method | No longer implemented; the spec dropped it |
+| MCP is now stateless | Every request carries its protocol version in `_meta` |
+| `server/discover` is mandatory | Implemented; advertises `supportedVersions`, `capabilities`, identity |
+| Every result needs `resultType` | Added to every response |
+| Results carry `_meta` server info | Added to every response |
+| List results are cacheable | `tools/list` and `server/discover` carry `ttlMs` + `cacheScope` |
+| Unknown protocol version | Returns `-32022` with the supported-version list, per SEP-2575 |
+
+```python
+# Discover is how a client picks a compatible revision.
+server.handle(McpRequest({"id": 1, "method": "server/discover", "params": {}}))
+# -> {"result": {"supportedVersions": ["2026-07-28"], "capabilities": {...},
+#               "ttlMs": 30000, "cacheScope": "public", "resultType": "complete",
+#               "_meta": {"io.modelcontextprotocol/serverInfo": {...}}}, ...}
+```
+
+The response shapes in this README are checked against the upstream MCP JSON
+Schema (`tests/schema-2026-07-28.json`) on every test run, so they cannot
+silently drift from the spec.
 
 ## API
 
@@ -88,7 +121,7 @@ def add_handler(params):
 
 ### `server.handle(request)`
 
-Dispatch a single `McpRequest` and return an `McpResponse`. The methods supported are `initialize`, `tools/list`, `tools/call`, `ping`. Unknown methods return a JSON-RPC 2.0 error with code -32601.
+Dispatch a single `McpRequest` and return an `McpResponse`. The methods supported are `server/discover`, `tools/list`, and `tools/call`. Unknown methods return a JSON-RPC 2.0 error with code -32601. A request declaring an unsupported protocol version in `_meta` returns -32022 with the list of supported versions.
 
 ### `server.as_router() -> Router`
 
