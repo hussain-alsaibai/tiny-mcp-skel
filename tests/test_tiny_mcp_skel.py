@@ -7,12 +7,15 @@ import sys
 import unittest
 from io import StringIO
 
-# Add the tiny-* family to sys.path so the skeleton can import its deps.
-BASE = "/home/node/.openclaw/workspace"
+# Make the tiny-* siblings importable when they are checked out next to
+# this repository (local development). In CI they are pip-installed, so the
+# path below usually does not exist and the installed packages are used.
+_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PARENT = os.path.dirname(_HERE)
 for sub in ("tiny-router", "tiny-validator"):
-    p = f"{BASE}/{sub}"
-    if p not in sys.path:
-        sys.path.insert(0, p)
+    _p = os.path.join(_PARENT, sub)
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from tiny_mcp_skel import (  # noqa: E402
     McpCallError,

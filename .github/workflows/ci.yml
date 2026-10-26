@@ -16,10 +16,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install siblings from PyPI
+      - name: Install siblings from GitHub
         run: |
           pip install --upgrade pip
-          pip install "tiny-router>=0.7.0" "tiny-validator>=0.5.0"
+          # tiny-validator is not published on PyPI, and the newest tiny-router
+          # release there (0.0.8) does not satisfy the >=0.7.0 pin, so these
+          # two siblings are installed straight from their repositories.
+          pip install "tiny-router @ git+https://github.com/hussain-alsaibai/tiny-router.git"
+          pip install "tiny-validator @ git+https://github.com/hussain-alsaibai/tiny-validator.git"
       - name: Install tiny-mcp-skel
         run: pip install -e .
       - name: Install test dependencies
